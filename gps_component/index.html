@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 8px; color: #222; }
+    #status { padding: 12px; border-radius: 8px; background: #f1f5f9;
+      font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-line; }
+    .active { color: #15803d; font-weight: 700; }
+    .warning { color: #a16207; font-weight: 700; }
+    .error { color: #b91c1c; font-weight: 700; }
+    .muted { color: #475569; }
+  </style>
+</head>
+<body>
+  <div id="status"><span class="muted">Connecting GPS component to Streamlit…</span></div>
+  <script>
+    (() => {
+      "use strict";
+
+      const statusElement = document.getElementById("status");
+      let watchId = null;
+      let trackingEnabled = false;
+      let lastSentAt = 0;
+      let lastPositionTimestamp = 0;
+      let updateInterval = 5000;
+      let gpsTimeout = 30000;
+      let maxAccuracy = 100;
+      let lastMessage = "";
+      let startInProgress = false;
+
+      function setFrameHeight(height = 150) {
+        window.parent.postMessage({
+          isStreamlitMessage: true,
+          type: "streamlit:setFrameHeight",
+          height
+        }, "*");
+      }
+
+      function setStatus(message, cssClass = "muted") {
+        const span = document.createElement("span");
+        span.className = cssClass;
+        span.textContent = message;
+        statusElement.replaceChildren(span);
+        setFrameHeight(150);
+      }
+
+      function sendToStreamlit(value) {
+        window.parent.postMessage({
+          isStreamlitMessage: true,
+          type: "streamlit:setComponentValue",
+          value,
+          dataType: "json"
+        }, "*");
+      }
+
+      function report(status, message, extra = {}) {
+        const signature = status + "|" + message;
+        if (signature !== lastMessage) {
+          lastMessage = signature;
+          sendToStreamlit({ status, message, ...extra });
+        }
+      }
+
+      function stopTracking() {
+        if (watchId !== null && navigator.geolocation) {
+          navigator.geolocation.clearWatch(watchId);
+        }
+        watchId = null;
+        trackingEnabled = false;
+        startInProgress = false;
+        lastSentAt = 0;
+        lastPositionTimestamp = 0;
+        setStatus("Automatic GPS tracking is stopped.", "muted");
+        report("stopped", "Automatic GPS tracking is stopped.");
+      }
+
+      async function checkPermission() {
+        if (!navigator.permissions || !navigator.permissions.query) return "unknown";
+        try {
+          const result = await navigator.permissions.query({ name: "geolocation" });
+          return result.state || "unknown";
+        } catch (_) {
+          return "unknown";
+        }
+      }
+
+      async function startTracking() {
+        if (watchId !== null || startInProgress || !trackingEnabled) return;
+        startInProgress = true;
+
+        try {
+          if (!window.isSecureContext && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
+            const message = "Android Chrome blocks GPS on ordinary local-network HTTP links. Open this same dashboard using HTTPS (or localhost), then allow Location permission.";
+            setStatus(message, "error");
+            report("error", message);
+            return;
+          }
+
+          if (!navigator.geolocation) {
+            const message = "Geolocation is not available in this browser. Try an updated Chrome browser.";
+            setStatus(message, "error");
+            report("error", message);
+            return;
+          }
+
+          setStatus("Requesting browser location permission and waiting for the first GPS fix…", "warning");
+          report("waiting", "Waiting for browser location permission and the first GPS fix.");
+
+          const permission = await checkPermission();
+          if (!trackingEnabled) return;
+          if (permission === "denied") {
+            const message = "Location permission is blocked. In Chrome, open Site settings → Location → Allow, then reload this page.";
+            setStatus(message, "error");
+            report("error", message);
+            return;
+          }
+
+          watchId = navigator.geolocation.watchPosition(
+            (position) => {
+              const coords = position.coords || {};
+              const lat = Number(coords.latitude);
+              const lon = Number(coords.longitude);
+              const accuracy = Number(coords.accuracy);
+              const timestamp = Number(position.timestamp);
+
+              if (!Number.isFinite(lat) || !Number.isFinite(lon) ||
+                  !Number.isFinite(accuracy) || !Number.isFinite(timestamp) ||
+                  lat < -90 || lat > 90 || lon < -180 || lon > 180 || accuracy < 0) {
+                setStatus("The browser returned an invalid GPS reading. Waiting for another reading…", "warning");
+                return;
+              }
+
+              if (timestamp <= lastPositionTimestamp) return;
+              const now = Date.now();
+              if (now - lastSentAt < updateInterval) return;
+
+              lastPositionTimestamp = timestamp;
+              lastSentAt = now;
+              lastMessage = "";
+
+              const gpsData = {
+                status: "success",
+                latitude: lat,
+                longitude: lon,
+                accuracy,
+                speed: Number.isFinite(coords.speed) ? coords.speed : null,
+                heading: Number.isFinite(coords.heading) ? coords.heading : null,
+                timestamp
+              };
+
+              const qualityText = accuracy <= maxAccuracy
+                ? "Meets the accuracy requirement."
+                : `Received, but it will not be saved until accuracy is ${maxAccuracy} m or better.`;
+              setStatus(
+                "Browser GPS location received.\nLatitude: " + lat.toFixed(6) +
+                "\nLongitude: " + lon.toFixed(6) +
+                "\nAccuracy: " + accuracy.toFixed(1) + " metres\n" + qualityText +
+                "\nSending coordinates to the shipment dashboard…",
+                accuracy <= maxAccuracy ? "active" : "warning"
+              );
+              sendToStreamlit(gpsData);
+            },
+            (error) => {
+              let message = "Unable to retrieve GPS location.";
+              if (error && error.code === 1) {
+                message = "Location permission denied. Allow location access for this site in Chrome, then reload the page.";
+              } else if (error && error.code === 2) {
+                message = "Device position unavailable. Turn on device Location Services and check Chrome location permission.";
+              } else if (error && error.code === 3) {
+                message = "GPS request timed out. Keep this page open; the browser will continue waiting for another reading.";
+              }
+              setStatus(message, "error");
+              report("error", message);
+              // Keep the watch active: a later GPS fix may still arrive.
+            },
+            { enableHighAccuracy: true, maximumAge: 0, timeout: gpsTimeout }
+          );
+        } finally {
+          startInProgress = false;
+        }
+      }
+
+      function handleRender(event) {
+        const message = event.data;
+        if (!message || message.type !== "streamlit:render") return;
+        const args = message.args || {};
+        updateInterval = Math.max(1000, Number(args.update_interval) || 5000);
+        gpsTimeout = Math.max(5000, Number(args.timeout) || 30000);
+        maxAccuracy = Math.max(1, Number(args.max_accuracy) || 100);
+
+        if (args.enabled) {
+          trackingEnabled = true;
+          // Retry if a previous permission check/start attempt did not create a watch.
+          if (watchId === null && !startInProgress) startTracking();
+        } else if (trackingEnabled || watchId !== null) {
+          stopTracking();
+        } else {
+          setStatus("GPS tracking is currently off. Click Start GPS Tracking in the dashboard.", "muted");
+        }
+      }
+
+      window.addEventListener("message", handleRender);
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:componentReady",
+        apiVersion: 1
+      }, "*");
+      setFrameHeight(150);
+    })();
+  </script>
+</body>
+</html>
